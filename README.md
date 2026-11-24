@@ -89,9 +89,12 @@ For each usable sidecar it writes the saved position under:
   MD5 calculated from the adjacent book when the saved hash is absent.
 * **Filename ID:** MD5 of the exact UTF-8 basename, including its extension.
 
-The command defaults to a read-only preview. An applied batch is transactional
-and backed up. Sidecar modification times are used to protect newer server
-progress; `--force` lets sidecars win when explicitly desired. Ambiguous
+The command defaults to a read-only preview. Duplicate copies with the same
+content ID use the furthest saved percentage; equal progress is merged without
+a timestamp tiebreaker. Identical copies may share their filename ID too.
+An applied batch is transactional and backed up. Sidecar modification times
+are used to protect newer server progress; `--force` lets sidecars win when
+explicitly desired. Ambiguous
 filename IDs and invalid sidecars are reported and skipped. Books and sidecars
 are never edited, and Lua files are parsed as data without executing them.
 

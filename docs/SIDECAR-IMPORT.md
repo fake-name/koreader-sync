@@ -66,16 +66,23 @@ and sidecars without editing either, and does not send data to outside services.
   equal timestamp, skips that book entirely. This also avoids putting stale
   progress under a previously missing partner ID. The comparison and write
   happen in the same SQLite transaction, serialized with normal API writers.
-* Repeated imports leave identical progress unchanged. A newer sidecar can
-  legitimately move progress backward (for example, rereading a book).
+* Copies sharing a content hash use the **furthest saved percentage**, regardless
+  of which file was modified last. Equal progress is merged, not reported as a
+  conflict. If equal percentages contain different exact location strings, the
+  first encountered location is retained; modification time is not a tiebreaker.
+* Repeated imports leave identical progress unchanged. The server freshness
+  check still applies after resolving duplicates: this policy selects among
+  sidecar copies, and does not override newer server progress. The newest saved
+  time among copies with the exact winning position is used for that check.
 * `--force` intentionally lets the sidecar replace newer server positions,
   timestamped at import time. Preview it first with `--force`, then use
   `--force --apply` if that is the desired outcome.
-* Duplicate filenames in different scanned locations skip the filename ID and
-  still import unambiguous content IDs. Even identical copies are conservatively
-  treated this way. Collisions outside the scanned tree cannot be detected.
-* Copies sharing a content hash use the most recently saved sidecar. Conflicting
-  positions with the same newest timestamp are skipped, rather than guessed.
+* Duplicate filenames with the same content ID share their filename ID. A copy
+  without a usable sidecar is checked using its book's partial MD5. Different
+  or unverifiable content IDs still skip the ambiguous filename ID, while their
+  unambiguous content IDs can be imported. Collisions outside the scanned tree
+  cannot be detected. Different editions with the same filename are not assumed
+  to be identical books.
 * Missing positions/percentages, invalid hashes, unreadable/changing files, and
   malformed Lua data are reported and skipped. There is no invented position
   or completion percentage based on a book's “finished” label.

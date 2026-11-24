@@ -381,21 +381,45 @@ def unchanged(book):
 
 def plan(books, names, existing, force, now, report, counts):
     groups = defaultdict(list)
+    known_paths = defaultdict(set)
     for book in books:
         groups[book.content_id].append(book)
-    ambiguous = {name for name, paths in names.items() if len(paths) > 1}
-    relevant = ambiguous & {book.filename for book in books}
-    for name in sorted(relevant):
-        counts["collisions"] += 1
-        report(f"COLLISION: {name!r} appears in multiple locations; filename ID will be skipped")
+        known_paths[book.book_path].add(book.content_id)
+    ambiguous = set()
+    for name in sorted({book.filename for book in books}):
+        paths = names[name]
+        if len(paths) < 2:
+            continue
+        content_ids = set()
+        for path in sorted(paths):
+            if path in known_paths:
+                content_ids.update(known_paths[path])
+            else:
+                # An unread copy may have no usable sidecar. Confirm its identity
+                # with the same partial hash instead of treating all copies as a
+                # filename collision merely because their directories differ.
+                try:
+                    content_id, _ = partial_md5(path)
+                    content_ids.add(content_id)
+                except (OSError, ValueError):
+                    ambiguous.add(name)
+                    break
+        if len(content_ids) != 1:
+            ambiguous.add(name)
+        if name in ambiguous:
+            counts["collisions"] += 1
+            report(f"COLLISION: {name!r} has different or unverifiable content IDs; filename ID will be skipped")
     changes = []
     for content_id, copies in sorted(groups.items()):
-        source = max(copies, key=lambda book: book.timestamp)
-        latest = [book for book in copies if book.timestamp == source.timestamp]
-        if len({(book.progress, book.percentage) for book in latest}) > 1:
-            counts["errors"] += 1
-            report(f"SKIP: conflicting sidecars for hash {content_id} have equal timestamps")
-            continue
+        # max() keeps the first encountered copy when percentages are equal.
+        # Timestamps do not decide the winning position. Equal saved positions
+        # are duplicates, and equal percentages need no artificial time ranking.
+        source = max(copies, key=lambda book: book.percentage)
+        position = (source.progress, source.percentage)
+        # Keep the newest evidence of this exact position for the existing
+        # server freshness check; this does not choose a different position.
+        saved_at = max(book.timestamp for book in copies
+                       if (book.progress, book.percentage) == position)
         if not all(unchanged(book) for book in copies):
             counts["errors"] += 1
             report(f"SKIP: files for {source.filename!r} changed during scanning; rerun")
@@ -406,14 +430,13 @@ def plan(books, names, existing, force, now, report, counts):
             counts["errors"] += 1
             report(f"SKIP: filename/content hash collision for {source.filename!r}")
             continue
-        position = (source.progress, source.percentage)
         rows = [existing[document] for document in ids if document in existing]
-        if not force and any(row["timestamp"] >= source.timestamp and
+        if not force and any(row["timestamp"] >= saved_at and
                              (row["progress"], row["percentage"]) != position for row in rows):
             counts["protected"] += 1
             report(f"KEEP SERVER: {source.filename!r}: newer/equal-time server progress; both IDs left alone")
             continue
-        timestamp = now if force else source.timestamp
+        timestamp = now if force else saved_at
         # If a newer server record already holds this very same position, use its
         # time when filling in its missing partner; do not turn it into an older update.
         if not force:
@@ -429,6 +452,8 @@ def plan(books, names, existing, force, now, report, counts):
             affected.append("content" if document == content_id else "filename")
         if affected:
             counts["changed_books"] += 1
+            if len(copies) > 1:
+                report(f"MERGE: {len(copies)} copies -> {source.percentage:.2%} from {str(source.sidecar)!r}")
             report(f"UPDATE ({', '.join(affected)}): {source.filename!r} -> {source.percentage:.2%}")
     return changes
 

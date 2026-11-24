@@ -181,18 +181,55 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(self.run_import(apply=True)[0], 1)
         self.assertEqual(len(self.rows()), 1)
 
-    def test_same_content_different_names_uses_latest(self):
-        self.book("Old Name.epub")
-        self.book("New Name.epub", position="new-position", saved=self.saved + 1)
+    def test_same_content_different_names_uses_furthest_even_when_older(self):
+        self.book("Old Name.epub", percentage=.8, position="furthest")
+        self.book("New Name.epub", position="new-position", percentage=.2, saved=self.saved + 1)
         self.run_import(apply=True)
         self.assertEqual(len(self.rows()), 3)
-        self.assertTrue(all(r["progress"] == "new-position" for r in self.rows().values()))
+        self.assertTrue(all(r["progress"] == "furthest" for r in self.rows().values()))
+        self.assertTrue(all(r["percentage"] == .8 for r in self.rows().values()))
 
-    def test_equal_time_conflicting_copies_are_skipped(self):
-        self.book("First.epub")
-        self.book("Second.epub", position="other")
-        self.assertEqual(self.run_import(apply=True)[0], 1)
-        self.assertFalse(self.rows())
+    def test_identical_copies_share_filename_id_and_merge_equal_positions(self):
+        self.book(folder="one")
+        self.book(folder="two", saved=self.saved + 1)
+        code, text = self.run_import(apply=True)
+        self.assertEqual(code, 0)
+        self.assertIn("MERGE: 2 copies", text)
+        self.assertNotIn("COLLISION", text)
+        self.assertEqual(len(self.rows()), 2)
+        self.assertTrue(all(r["progress"] == "/body/p[12]/text().4" for r in self.rows().values()))
+        self.assertTrue(all(r["timestamp"] == self.saved + 1 for r in self.rows().values()))
+        self.assertIn("Wrote 0 IDs", self.run_import(apply=True)[1])
+
+    def test_duplicate_filename_same_hash_uses_furthest_for_both_ids(self):
+        self.book(folder="one", position="ahead", percentage=.9)
+        self.book(folder="two", position="behind", percentage=.2, saved=self.saved + 10)
+        self.assertEqual(self.run_import(apply=True)[0], 0)
+        self.assertEqual(len(self.rows()), 2)
+        self.assertTrue(all(r["progress"] == "ahead" for r in self.rows().values()))
+
+    def test_equal_percentage_keeps_first_position_without_time_tiebreaker(self):
+        self.book("First.epub", position="first-location")
+        self.book("Second.epub", position="other-location", saved=self.saved + 1)
+        self.assertEqual(self.run_import(apply=True)[0], 0)
+        self.assertEqual(len(self.rows()), 3)
+        self.assertTrue(all(r["progress"] == "first-location" for r in self.rows().values()))
+
+    def test_equal_time_different_progress_uses_furthest(self):
+        self.book("First.epub", position="behind", percentage=.1)
+        self.book("Second.epub", position="ahead", percentage=.8)
+        self.assertEqual(self.run_import(apply=True)[0], 0)
+        self.assertTrue(all(r["progress"] == "ahead" for r in self.rows().values()))
+
+    def test_identical_copy_without_sidecar_shares_filename_id(self):
+        actual_hash = hashlib.md5(b"ebook").hexdigest()
+        self.book(content_id=actual_hash)
+        other = self.root / "elsewhere"
+        other.mkdir()
+        (other / "Book.epub").write_bytes(b"ebook")
+        self.assertEqual(self.run_import(apply=True)[0], 0)
+        self.assertEqual(len(self.rows()), 2)
+        self.assertIn(("reader", hashlib.md5(b"Book.epub").hexdigest()), self.rows())
 
     def test_pdf_page_and_partial_md5_fallback(self):
         content = bytes(range(251)) * 300

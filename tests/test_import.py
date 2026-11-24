@@ -96,9 +96,11 @@ class ImportTests(unittest.TestCase):
         os.utime(sidecar, (stamp, stamp))
         return book, sidecar
 
-    def run_import(self, apply=False, force=False, user=None, mappings_only=False, strict_filenames=False, pull=False):
+    def run_import(self, apply=False, force=False, user=None, mappings_only=False, strict_filenames=False, pull=False,
+                   no_cache=False, cache=None):
         args = type("Args", (), dict(directory=str(self.root), database=str(self.database),
-                                     user=user, apply=apply, force=force, mappings_only=mappings_only, strict_filenames=strict_filenames, pull=pull))()
+                                     user=user, apply=apply, force=force, mappings_only=mappings_only,
+                                     strict_filenames=strict_filenames, pull=pull, no_cache=no_cache, cache=cache))()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             code = imp.run(args)

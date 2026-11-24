@@ -20,7 +20,7 @@ command -v apt-get >/dev/null || die 'This script is for Debian/Ubuntu.'
 id herp >/dev/null 2>&1 || die 'The service account herp must already exist.'
 service_group=$(id -gn herp)
 [[ "$source_dir" != "$app_dir" ]] || die 'Run from a separate checkout, not /opt/koreader-sync.'
-for file in koreader_sync.py sync_storage.py koreader-flask.py wsgi.py requirements.txt \
+for file in koreader_sync.py sync_storage.py scan_cache.py koreader-flask.py wsgi.py requirements.txt \
             import_sidecars.py install-kosync-import.sh bin/kosync-import \
             bin/kosync-map-scan systemd/koreader-sync-mappings.service \
             systemd/koreader-sync-mappings.timer systemd/koreader-sync-mappings.default \
@@ -35,7 +35,7 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
 python3 - "$source_dir" <<'CHECK_SOURCE'
 import pathlib, sys
 source = pathlib.Path(sys.argv[1])
-for name in ('koreader_sync.py', 'sync_storage.py', 'koreader-flask.py', 'wsgi.py', 'import_sidecars.py'):
+for name in ('koreader_sync.py', 'sync_storage.py', 'scan_cache.py', 'koreader-flask.py', 'wsgi.py', 'import_sidecars.py'):
     compile((source / name).read_text(encoding='utf-8'), name, 'exec')
 CHECK_SOURCE
 
@@ -130,6 +130,7 @@ printf 'Preview sidecar import: runuser -u herp -- kosync-import /mnt/data/Reade
 printf 'Apply sidecar import:   runuser -u herp -- kosync-import /mnt/data/Reader_Sync --apply\n'
 printf 'Logs: journalctl -u koreader-sync -n 50 --no-pager\n'
 printf 'Scheduled scan: every 15 minutes; refreshes aliases and pulls newer server progress into sidecars.\n'
+printf 'Unchanged sidecar data and book hashes are cached; scans still check file metadata.\n'
 printf 'Sidecar progress uploads remain manual. Sidecar backups: /var/lib/koreader-sync/sidecar-backups/\n'
 printf 'Mapping settings: /etc/default/koreader-sync-mappings\n'
 printf 'Mapping scan logs: journalctl -u koreader-sync-mappings -n 50 --no-pager\n'

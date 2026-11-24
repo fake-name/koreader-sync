@@ -33,6 +33,12 @@ No changes occur without `--apply`. Preview reports both database changes and
 sidecar pulls, and creates no backup files. A nonexistent database is rejected.
 An older schema is rejected with instructions to run full setup first.
 
+The file cache defaults to `scan-cache.sqlite3` beside the progress database.
+Use `--cache PATH` to override it, or `--no-cache` to bypass it completely for
+that invocation. Previews never create or update cache files. An installation
+already using shared book IDs only needs `git pull --ff-only` followed by
+`sudo bash install-kosync-import.sh` to add caching to its existing timer.
+
 ## Identity matching
 
 The database has one position per internal `book_id`, scoped to a user. The
@@ -162,6 +168,47 @@ at its recorded path with its original owner/mode.
 Exit status: 0 = success; 1 = completed with individual file/collision errors;
 2 = fatal error. Missing saved progress is informational, not an error. The
 oneshot service accepts status 1 while keeping the warnings in its journal.
+
+## Skipping unchanged file contents
+
+The timer remains a 15-minute oneshot job. Each pass enumerates the directory
+tree to detect additions/deletions and checks file metadata. It **does not**
+use a directory's mtime as evidence that all descendants are unchanged.
+
+Successful parsed sidecar fields and partial book hashes are cached separately
+by absolute path. A cache hit requires the same nanosecond mtime, file size,
+device, inode, and ctime. Mtime comparisons are for equality, so a replacement
+carrying an older source timestamp is still detected. Inode/ctime also catch
+ordinary atomic replacements with the same size and mtime. An EPUB change
+rehashes that EPUB; an unrelated sidecar change does not rehash the book.
+Unopened books are cached too. Failed reads are retried on subsequent scans.
+
+The cache persists across timer invocations and reboots. It contains only the
+sidecar fields used for matching/progress, not annotations or raw Lua content.
+No-change scans do not rewrite it. Private permissions match the importer data
+directory. A corrupt/unavailable cache falls back to source reads with a warning;
+it is disposable and can be removed while the scanner is stopped. A one-off
+`--no-cache` run leaves an existing cache untouched.
+
+Progress/aliases are always checked against the live SQLite database; there are
+no HTTP fetches. A newer, different server position still opens the affected
+sidecar for its exact backup and atomic rewrite. The next scan refreshes that
+changed sidecar's cached parse once. Newer timestamps with an identical position
+do not reopen it. File signatures are rechecked before committing mappings and
+before replacing a sidecar, just as with uncached scans.
+
+This works with local filesystems (including filesystems on zvols) and NFS book
+trees. It uses ordinary directory/stat operations, not inotify notifications,
+so remote NFS changes are found once visible through the mount's attribute
+cache. Metadata polling still incurs directory/stat traffic over NFS; avoiding
+that too would require notifications from the machine writing the files. Keep
+the SQLite progress database and scan cache on local storage.
+
+Syncthing [preserves file modification times](https://docs.syncthing.net/users/faq.html#what-things-are-synced)
+and [uses file metadata to decide when to rehash](https://docs.syncthing.net/users/syncing.html#scanning).
+Directory mtimes are not preserved. As with any metadata-based cache, changes
+that leave every checked attribute identical cannot be detected without reading
+the contents; `--no-cache` provides that explicit bypass.
 
 ## References
 

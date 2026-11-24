@@ -6,6 +6,7 @@ Does not execute Lua or modify ebook content. See docs/SIDECAR-IMPORT.md.
 """
 
 import argparse
+import base64
 from collections import Counter, defaultdict
 from contextlib import closing
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ import time
 import uuid
 
 import sync_storage
+from scan_cache import ScanCache
 
 MAX_BYTES = 32 * 1024 * 1024
 FIELDS = {b"doc_path", b"partial_md5_checksum", b"last_xpointer",
@@ -258,6 +260,67 @@ def partial_md5(path):
     return digest.hexdigest(), signature(before)
 
 
+def encode_fields(fields):
+    return {key.decode('ascii'): {'bytes': base64.b64encode(value).decode('ascii')}
+            if isinstance(value, bytes) else value for key, value in fields.items()}
+
+
+def decode_fields(payload):
+    if not isinstance(payload, dict):
+        raise ValueError('invalid cached metadata')
+    fields = {}
+    for key, value in payload.items():
+        field = key.encode('ascii')
+        if field not in FIELDS:
+            raise ValueError('unknown cached field')
+        if isinstance(value, dict):
+            if set(value) != {'bytes'} or not isinstance(value['bytes'], str):
+                raise ValueError('invalid cached byte string')
+            value = base64.b64decode(value['bytes'], validate=True)
+        elif value is not None and type(value) not in (bool, int, float):
+            raise ValueError('invalid cached scalar')
+        fields[field] = value
+    return fields
+
+
+def cached_sidecar(path, cache):
+    if cache is None:
+        return read_sidecar(path)
+    info = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BYTES:
+        raise Invalid('not a regular file or larger than 32 MiB')
+    payload = cache.get(path, 'sidecar', signature(info))
+    if payload is not None:
+        try:
+            fields = decode_fields(payload)
+        except (ValueError, UnicodeError):
+            pass  # A disposable bad entry is replaced from its source.
+        else:
+            cache.counts['sidecar_hit'] += 1
+            return fields, info
+    fields, info = read_sidecar(path)
+    cache.counts['sidecar_read'] += 1
+    cache.put(path, 'sidecar', signature(info), encode_fields(fields))
+    return fields, info
+
+
+def cached_partial_md5(path, cache):
+    if cache is None:
+        return partial_md5(path)
+    info = path.stat(follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise Invalid('book is not a regular file')
+    stamp = signature(info)
+    digest = cache.get(path, 'hash', stamp)
+    if isinstance(digest, str) and MD5.fullmatch(digest):
+        cache.counts['hash_hit'] += 1
+        return digest, stamp
+    digest, stamp = partial_md5(path)
+    cache.counts['hash_read'] += 1
+    cache.put(path, 'hash', stamp, digest)
+    return digest, stamp
+
+
 @dataclass
 class Book:
     sidecar: Path | None
@@ -283,8 +346,8 @@ def decode(value, field):
         raise Invalid(f"{field} is not UTF-8") from error
 
 
-def load_book(path, now, mappings_only=False):
-    data, info = read_sidecar(path)
+def load_book(path, now, mappings_only=False, cache=None):
+    data, info = cached_sidecar(path, cache)
     suffix = METADATA.fullmatch(path.name)[1]
     stem = path.parent.name[:-4]
     filename = stem if suffix == "_" else stem + "." + suffix
@@ -300,26 +363,26 @@ def load_book(path, now, mappings_only=False):
     percentage = data.get(b"percent_finished")
     progress = None
     issue = None
-    if not mappings_only:
-        try:
-            if percentage is None:
-                raise Invalid("no percentage saved; mappings only")
-            if type(percentage) not in (int, float) or not math.isfinite(percentage) or not 0 <= percentage <= 1:
-                raise Invalid(f"invalid percent_finished {percentage!r}; mappings only")
-            if data.get(b"last_xpointer"):
-                progress = decode(data[b"last_xpointer"], "last_xpointer")
-            else:
-                page = data.get(b"last_page")
-                if type(page) not in (int, float) or not math.isfinite(page) or page < 1 or int(page) != page:
-                    raise Invalid("no saved reading location; mappings only")
-                progress = str(int(page))
-            if len(progress) > 65536:
-                raise Invalid("reading position is too long; mappings only")
-            percentage = float(percentage)
-        except (Invalid, OverflowError) as error:
-            progress, percentage, issue = None, None, str(error)
-    else:
-        percentage = None
+    # Retain the parsed position even on mapping-only passes so an identical
+    # server position can be skipped without reopening the sidecar. plan()
+    # still forbids position uploads when mappings_only is true.
+    try:
+        if percentage is None:
+            raise Invalid("no percentage saved; mappings only")
+        if type(percentage) not in (int, float) or not math.isfinite(percentage) or not 0 <= percentage <= 1:
+            raise Invalid(f"invalid percent_finished {percentage!r}; mappings only")
+        if data.get(b"last_xpointer"):
+            progress = decode(data[b"last_xpointer"], "last_xpointer")
+        else:
+            page = data.get(b"last_page")
+            if type(page) not in (int, float) or not math.isfinite(page) or page < 1 or int(page) != page:
+                raise Invalid("no saved reading location; mappings only")
+            progress = str(int(page))
+        if len(progress) > 65536:
+            raise Invalid("reading position is too long; mappings only")
+        percentage = float(percentage)
+    except (Invalid, OverflowError) as error:
+        progress, percentage, issue = None, None, str(error)
     content_id = data.get(b"partial_md5_checksum")
     book_signature = None
     if content_id is not None:
@@ -329,10 +392,10 @@ def load_book(path, now, mappings_only=False):
     else:
         # Prefer the saved hash: that is what KOReader actually sends, and it
         # describes the edition whose reading position is saved in this sidecar.
-        content_id, book_signature = partial_md5(book_path)
+        content_id, book_signature = cached_partial_md5(book_path, cache)
     current_id = None
     if mappings_only and book_path.is_file():
-        current_id, book_signature = partial_md5(book_path)
+        current_id, book_signature = cached_partial_md5(book_path, cache)
     timestamp = info.st_mtime_ns // 1_000_000_000
     if timestamp <= 0 or timestamp > now:
         progress, percentage = None, None
@@ -342,7 +405,7 @@ def load_book(path, now, mappings_only=False):
                 progress, percentage, timestamp, current_id, issue)
 
 
-def scan(root, report, now, mappings_only=False):
+def scan(root, report, now, mappings_only=False, cache=None):
     books = []
     names = defaultdict(set)
     counts = Counter()
@@ -362,7 +425,7 @@ def scan(root, report, now, mappings_only=False):
                     continue
                 counts["sidecars"] += 1
                 try:
-                    book = load_book(base / name, now, mappings_only)
+                    book = load_book(base / name, now, mappings_only, cache)
                     books.append(book)
                     names[book.filename].add(book.book_path)
                     if book.position_issue and not mappings_only:
@@ -383,7 +446,7 @@ def scan(root, report, now, mappings_only=False):
                 continue
             for path in sorted(paths - seen):
                 try:
-                    content_id, info = partial_md5(path)
+                    content_id, info = cached_partial_md5(path, cache)
                     books.append(Book(None, None, path, info, name, content_id,
                                       hashlib.md5(name.encode("utf-8")).hexdigest(), None, None, 0))
                 except (OSError, ValueError) as error:
@@ -447,7 +510,7 @@ class IdGroups:
             self.parents[self.root(value)] = root
 
 
-def plan(books, names, existing, force, now, report, counts, mappings_only=False, strict_filenames=False):
+def plan(books, names, existing, force, now, report, counts, mappings_only=False, strict_filenames=False, cache=None):
     identities = IdGroups()
     known_paths = defaultdict(set)
     existing_books = {}
@@ -474,7 +537,7 @@ def plan(books, names, existing, force, now, report, counts, mappings_only=False
                 hashes.update(known_paths[path])
             else:
                 try:
-                    digest, _ = partial_md5(path)
+                    digest, _ = cached_partial_md5(path, cache)
                     hashes.add(digest)
                 except (OSError, ValueError):
                     ambiguous.add(name)
@@ -537,7 +600,7 @@ def plan(books, names, existing, force, now, report, counts, mappings_only=False
         current = rows.get(target)
         position_changed = selected is not None and (not current or
             any(current[key] != selected[key] for key in sync_storage.POSITION_FIELDS))
-        new_aliases = aliases - existing.keys()
+        new_aliases = {key for key in aliases if key not in existing}
         merged = max(0, len(previous) - 1)
         if not new_aliases and not merged and not position_changed:
             counts["unchanged_ids"] += len(aliases)
@@ -663,7 +726,7 @@ def write_sidecar(book, info, original, updated, timestamp, database):
     return backup
 
 
-def sync_sidecars(books, positions, database, apply, report, counts):
+def sync_sidecars(books, positions, database, apply, report, counts, cache=None):
     for book in books:
         if book.sidecar is None:
             continue  # Do not manufacture KOReader settings for unopened books.
@@ -672,10 +735,14 @@ def sync_sidecars(books, positions, database, apply, report, counts):
             continue
         if position['timestamp'] <= book.timestamp:
             continue
+        if (book.progress, book.percentage) == (position['progress'], position['percentage']):
+            continue
         try:
             if not unchanged(book):
                 raise Invalid('sidecar/book changed since scanning; will retry')
             _, info, original = read_sidecar(book.sidecar, raw=True)
+            if cache is not None:
+                cache.counts['sidecar_read'] += 1
             if signature(info) != book.sidecar_signature:
                 raise Invalid('sidecar changed since scanning; will retry')
             updated = patch_sidecar(original, book.filename, position)
@@ -698,6 +765,7 @@ def run(args):
         raise Invalid(f"book directory does not exist: {root}")
     # Validate the account/schema before spending time scanning a large library.
     db = open_database(database, readonly=not args.apply)
+    cache = None
     try:
         mappings_only = getattr(args, "mappings_only", False)
         pull = getattr(args, "pull", None)
@@ -712,14 +780,22 @@ def run(args):
         print(f"{'APPLY' if args.apply else 'PREVIEW'}: account={username!r}, directory={str(root)!r}")
         if args.force:
             print("FORCE: sidecar positions may replace newer server progress.")
+        if not getattr(args, 'no_cache', False):
+            cache_path = Path(getattr(args, 'cache', None) or database.with_name('scan-cache.sqlite3')).resolve()
+            if cache_path == database or (cache_path.exists() and cache_path.samefile(database)):
+                raise Invalid('the scan cache must be separate from the progress database')
+            cache = ScanCache(cache_path, writable=args.apply)
         now = int(time.time())
-        books, names, counts = scan(root, print, now, mappings_only)
+        books, names, counts = scan(root, print, now, mappings_only, cache)
+        if cache is not None:
+            cache.flush()
         # Readers remain available. BEGIN IMMEDIATE serializes this batch with
         # API writers, so no update can race our freshness check and commit.
         db.execute("BEGIN IMMEDIATE" if args.apply else "BEGIN")
         select_user(db, username)
         existing = sync_storage.snapshot(db, username)
-        changes = plan(books, names, existing, args.force, now, print, counts, mappings_only, getattr(args, "strict_filenames", False))
+        changes = plan(books, names, existing, args.force, now, print, counts, mappings_only,
+                       getattr(args, "strict_filenames", False), cache)
         backup = None
         if args.apply and changes:
             backup = backup_database(database)
@@ -728,7 +804,7 @@ def run(args):
         db.commit()
         if pull:
             positions = sync_storage.snapshot(db, username) if args.apply else sync_storage.project_links(existing, changes)
-            sync_sidecars(books, positions, database, args.apply, print, counts)
+            sync_sidecars(books, positions, database, args.apply, print, counts, cache)
         verb = "Wrote" if args.apply else "Would write"
         print(f"{verb} {counts['written_ids']} IDs for {counts['changed_books']} books; "
               f"{counts['sidecars']} sidecars scanned, {counts['unchanged_ids']} IDs unchanged, "
@@ -738,11 +814,16 @@ def run(args):
               f"{counts['pulled_sidecars']} sidecars {'updated' if args.apply else 'would be updated'}.")
         if backup:
             print(f"Backup: {backup}")
+        if cache is not None:
+            cache.flush()
+            print(cache.summary())
         if not args.apply:
             print("Preview only. Add --apply to write these updates.")
         return 1 if counts["errors"] or counts["collisions"] else 0
     finally:
         db.close()
+        if cache is not None:
+            cache.close()
 
 
 def main():
@@ -750,6 +831,8 @@ def main():
     parser.add_argument("directory", nargs="?", default="/mnt/data/Reader_Sync",
                         help="book tree to scan recursively (default: /mnt/data/Reader_Sync)")
     parser.add_argument("--database", default="/var/lib/koreader-sync/sync.sqlite3")
+    parser.add_argument("--cache", help="file-content cache (default: scan-cache.sqlite3 beside the progress database)")
+    parser.add_argument("--no-cache", action="store_true", help="reread sidecars and recompute needed hashes without reading/writing the cache")
     parser.add_argument("--user", help="existing KOReader sync username; auto-selected if exactly one exists")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="write changes (default is preview only)")

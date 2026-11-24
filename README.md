@@ -119,13 +119,33 @@ Setup enables a scan two minutes after boot and 15 minutes after each completed
 scan. It runs as `herp` and does **not upload sidecar positions**. It:
 
 1. Scans sidecars and supported ebook files, including unopened books.
-2. Calculates current partial hashes, registers new filename/hash aliases, and
-   preserves historical aliases.
+2. Checks file metadata, reuses cached sidecar data/hashes for unchanged files,
+   and registers new filename/hash aliases while preserving historical aliases.
 3. Pulls newer server positions into existing sidecars for Syncthing to deliver.
 
 It neither creates settings sidecars for unopened books nor modifies EPUB/PDF
 content. Initial progress uploads remain manual; normal KOReader auto-sync can
 continue handling subsequent tablet uploads.
+
+Scans use a persistent, disposable SQLite cache at
+`/var/lib/koreader-sync/scan-cache.sqlite3`. The first applied scan fills it.
+Later scans still list directories and stat files, but do not reopen unchanged
+sidecars or rehash unchanged ebooks. Cache entries match nanosecond mtime, size,
+device/inode, and ctime; they survive service runs and reboots. The journal
+reports how many sidecars/hashes were reused versus read/computed.
+
+This also works with an NFS book tree, without depending on remote inotify
+events. NFS attribute caching may delay when a change becomes visible. Keep
+the cache and progress database on the container's local storage. Server
+progress is checked independently on every pass, so a newer server position
+can still update an otherwise unchanged sidecar.
+
+For a one-off scan that bypasses the cache, add `--no-cache` to `kosync-import`.
+`--cache PATH` overrides its location. Previews may read an existing cache but
+never create or update it. An unavailable/corrupt cache produces a warning and
+falls back to source reads. To rebuild it, stop the mapping service/timer,
+remove **only** `scan-cache.sqlite3`, and restart the timer; it contains no
+authoritative progress or aliases.
 
 Edit `/etc/default/koreader-sync-mappings` to change the directory or account:
 
@@ -205,5 +225,7 @@ sh -n bin/kosync-map-scan
 Tests use temporary databases/files. They cover API authentication and isolation,
 concurrency, migration, alias linking, hash churn, backups, parser behavior,
 bidirectional progress, atomic sidecar writes, and preservation of annotations.
+Cache tests verify that unchanged scans do not read sidecar/ebook contents,
+file replacement invalidates cached data, and server-only changes still pull.
 
 The original project's invitation to modify it was: “Do whatever you want to”.

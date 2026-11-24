@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*.bak
+import-backups/
+setup-backups/
+users.json
+*.log
+*.log.*

@@ -1,0 +1,25 @@
+[Unit]
+Description=KOReader reading progress sync
+After=network.target
+
+[Service]
+Type=simple
+User=herp
+WorkingDirectory=/opt/koreader-sync
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+# One worker, two threads; SQLite serializes concurrent writes transactionally.
+ExecStart=/opt/koreader-sync/venv/bin/gunicorn \
+    --bind 0.0.0.0:8082 \
+    --workers 1 \
+    --threads 2 \
+    --worker-class gthread \
+    --access-logfile - \
+    --error-logfile - \
+    wsgi:app
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

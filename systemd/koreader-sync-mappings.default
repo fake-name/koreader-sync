@@ -1,0 +1,9 @@
+# Scan interval is controlled by koreader-sync-mappings.timer.
+KOSYNC_BOOK_DIRECTORY="/mnt/data/Reader_Sync"
+KOSYNC_DATABASE="/var/lib/koreader-sync/sync.sqlite3"
+# Leave empty to select the sole existing KOReader sync account.
+KOSYNC_SYNC_USER=""
+# Default: a shared basename joins different EPUB versions into one book.
+KOSYNC_STRICT_FILENAMES=0
+# Pull newer server positions into existing sidecars for Syncthing to deliver.
+KOSYNC_PULL_SIDECARS=1

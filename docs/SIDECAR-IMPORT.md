@@ -1,136 +1,174 @@
-# Manual KOReader sidecar import
+# Book aliases and sidecar synchronization
 
-Adds a `kosync-import` command to the Python/SQLite server installed by
-`setup-koreader-sync.sh`. No packages, network access, service restart, timer,
-password, or new account are needed. The existing HTTP API is unchanged.
+`kosync-import` is the manual tool. `kosync-map-scan` is its scheduled wrapper.
+Both use Python 3.10+'s standard library; no Lua interpreter or network service
+is needed to scan local files. Install/update from the whole repository using
+`sudo bash setup-koreader-sync.sh` first. This migrates the earlier SQLite schema
+and installs the shared storage module with the server and importer.
 
-## Install and run
+## Commands
 
-Inside the LXC container, as root:
+Run as the OS user `herp`, which can access both the book tree and database:
 
 ```sh
-git clone https://github.com/fake-name/koreader-sync.git
-cd koreader-sync
-bash install-kosync-import.sh
-runuser -u herp -- kosync-import /mnt/data/Reader_Sync
-runuser -u herp -- kosync-import /mnt/data/Reader_Sync --apply
+# Preview bidirectional progress sync and new alias relationships:
+sudo -u herp kosync-import /mnt/data/Reader_Sync
+# Apply the previewed type of operation, rechecking current files/database:
+sudo -u herp kosync-import /mnt/data/Reader_Sync --apply
+# Only build/refresh mappings; never import or write sidecar positions:
+sudo -u herp kosync-import /mnt/data/Reader_Sync --mappings-only --apply
+# Refresh mappings and pull newer server positions; no sidecar position uploads:
+sudo -u herp kosync-import /mnt/data/Reader_Sync --mappings-only --pull --apply
+# Import positions and mappings, leaving sidecar files alone:
+sudo -u herp kosync-import /mnt/data/Reader_Sync --no-pull --apply
 ```
 
-The first command previews; the second imports. Both default to that directory,
-so `runuser -u herp -- kosync-import --apply` also works. Run with the OS user
-`herp` so the books and database are accessible and new database files retain
-the right owner. If invoking from a sudo-enabled login, `sudo -u herp` works too.
+The directory defaults to `/mnt/data/Reader_Sync`. The database defaults to
+`/var/lib/koreader-sync/sync.sqlite3`, overridable with `--database PATH`.
+The sole existing sync account is selected automatically; otherwise specify
+`--user YOUR_KOREADER_USERNAME`. This is not the OS user or OPDS Basic Auth login.
+No password is needed for a local tool already granted access to the database.
 
-If there is exactly one KOReader sync account, it is selected automatically.
-Otherwise add `--user YOUR_KOREADER_USERNAME`. This is the sync account, not the
-OS user or OPDS login. No credentials are needed because this local command
-already has direct access to the server database.
+No changes occur without `--apply`. Preview reports both database changes and
+sidecar pulls, and creates no backup files. A nonexistent database is rejected.
+An older schema is rejected with instructions to run full setup first.
 
-Close the book on the tablet, allow Syncthing to finish, then import. Unsaved
-positions from a currently open book cannot be recovered from a sidecar.
+## Identity matching
 
-## What it imports
+The database has one position per internal `book_id`, scoped to a user. The
+`document_aliases` table connects protocol document keys to those IDs:
 
-Recursively scans `*.sdr/metadata.<extension>.lua`, including EPUB and PDF
-sidecars. Copies `last_xpointer` (reflowable books), or `last_page` (paged books),
-and `percent_finished` into the existing `progress` table under both identifiers:
+* Saved content key: the sidecar's `partial_md5_checksum`, as KOReader sends it.
+* Current content key: KOReader's partial MD5 calculated from the book during
+  a mapping scan, sampling 1 KiB at offsets 0, 1 KiB, 4 KiB, ... 1 GiB.
+* Filename key: MD5 of the exact UTF-8 basename, including its extension.
+  Directories are not part of this ID; spelling and case matter.
 
-* Content ID: the saved `partial_md5_checksum`, exactly as KOReader sends it.
-* Filename ID: MD5 of the UTF-8 basename, **including its extension**. Case and
-  spelling matter; directories are not part of the ID.
+A saved and current hash can differ for an updated web serial. Both become
+aliases. Same-name copies with different hashes are treated as versions of the
+same book by default. Copies with different names can also be linked by a shared
+hash or an already registered identity. Old aliases are retained when files are
+renamed, replaced, or removed.
 
-The basename comes from the conventional sidecar directory/metadata suffix.
-For hash-named sidecar directories without an adjacent book, `doc_path` supplies
-the basename; the Android absolute path does not have to exist on the server.
-When the saved content hash is missing, the adjacent book is required and the
-KOReader partial-MD5 algorithm is calculated (not whole-file MD5).
+The HTTP server does not infer relationships from an unknown key. It starts an
+independent identity until a scan supplies the association. Once linked,
+uploading through any key updates the one live position immediately.
 
-The saved hash is deliberately preferred over recalculating it: if a web serial
-EPUB was replaced after its last reading session, the saved position and hash
-describe the previously read version. Filename matching still addresses the
-same filename. This does not translate an old XPointer to a changed EPUB layout.
+Different unrelated books sharing the same basename will be joined by default.
+`--strict-filenames` skips a filename association when copies have different or
+unverifiable content identities. Its unambiguous content keys still work. This
+option is intentionally off for libraries that expect filename-based hash churn.
 
-This is a manual snapshot import. **It does not permanently link the two IDs:**
-subsequent normal client uploads still update only the ID that client uses.
-Run the importer again after the tablet's newer sidecars arrive. It reads books
-and sidecars without editing either, and does not send data to outside services.
+## Sidecar handling
 
-## Conflict handling
+Scans `*.sdr/metadata.<extension>.lua` recursively. Conventional sidecar names
+supply the filename. Hash-named sidecar directories can use `doc_path`'s basename;
+the absolute Android path need not exist on the server.
 
-* Defaults to a read-only preview; use `--apply` to write.
-* Uses sidecar modification time as a proxy for the position's saved time. This
-  is not an exact page-turn timestamp. Preserved Syncthing mtimes and correct
-  clocks matter; a later metadata-only edit or `touch` can make old progress
-  look newer. Files timestamped in the future are skipped.
-* If **either** matching server record has different progress with a newer or
-  equal timestamp, skips that book entirely. This also avoids putting stale
-  progress under a previously missing partner ID. The comparison and write
-  happen in the same SQLite transaction, serialized with normal API writers.
-* Copies sharing a content hash use the **furthest saved percentage**, regardless
-  of which file was modified last. Equal progress is merged, not reported as a
-  conflict. If equal percentages contain different exact location strings, the
-  first encountered location is retained; modification time is not a tiebreaker.
-* Repeated imports leave identical progress unchanged. The server freshness
-  check still applies after resolving duplicates: this policy selects among
-  sidecar copies, and does not override newer server progress. The newest saved
-  time among copies with the exact winning position is used for that check.
-* `--force` intentionally lets the sidecar replace newer server positions,
-  timestamped at import time. Preview it first with `--force`, then use
-  `--force --apply` if that is the desired outcome.
-* Duplicate filenames with the same content ID share their filename ID. A copy
-  without a usable sidecar is checked using its book's partial MD5. Different
-  or unverifiable content IDs still skip the ambiguous filename ID, while their
-  unambiguous content IDs can be imported. Collisions outside the scanned tree
-  cannot be detected. Different editions with the same filename are not assumed
-  to be identical books.
-* Missing positions/percentages, invalid hashes, unreadable/changing files, and
-  malformed Lua data are reported and skipped. There is no invented position
-  or completion percentage based on a book's “finished” label.
+A normal pass imports `last_xpointer` for reflowable books or `last_page` for
+paged books, together with `percent_finished` in 0..1. Missing/invalid percentages
+or locations do not reject identity mapping. For example, a cover-only sidecar
+can be linked and later receive a server position, without inventing an initial
+percentage. The separate `summary.status` finished/reading label is preserved
+and is not converted into a position.
 
-Only current `metadata.*.lua` files are considered. `.old` backups, legacy
-sidecars, Syncthing conflict files, `.stversions`, `.stfolder`, and symlinked
-directories are not scanned. Sidecar symlinks are rejected. The Lua reader
-accepts literal data only; it never executes the files. Size, nesting, and token
-limits keep malformed sidecars bounded. This supports normal KOReader dumps,
-not arbitrary executable Lua programs.
+The mapping-only pass also finds supported files without sidecars: EPUB, PDF,
+DjVu, CBZ, CBT, MOBI, AZW/AZW3, and FB2. It does not create settings sidecars for
+those books. It calculates current hashes even when cached sidecar hashes exist.
 
-## Backups and recovery
+`.old` backups, legacy sidecars, Syncthing conflict files, `.stversions`,
+`.stfolder`, and symlinked directories are excluded. Sidecar symlinks are rejected.
+Lua files are parsed as literal data, never executed. Size/nesting/token limits
+bound malformed inputs. Unsupported executable Lua is reported and skipped.
 
-Before a batch with changes, the command makes a consistent SQLite backup in:
+## Progress decisions
 
+* Duplicate sidecars use the furthest percentage. Equal progress is merged;
+  modification time is not a position tiebreaker. If equally far copies contain
+  different exact location strings, the first encountered location is retained.
+* When previously independent server records are joined, the furthest existing
+  progress is retained. Normal client uploads after linking retain the usual
+  latest-update behavior and may intentionally move backward.
+* For a manual position upload, a different server position with a newer or equal
+  timestamp is protected. Alias relationships are still registered. `--force`
+  explicitly lets sidecar positions win, stamped with import time.
+* Server progress is pulled into an existing sidecar only if the server timestamp
+  is strictly newer than that file's modification time. Matching positions are
+  left untouched, even if timestamps differ. `--no-pull` disables file updates.
+* A normal manual pass pulls by default. `--mappings-only` pulls only with
+  `--pull`; it never uploads sidecar positions, and rejects `--force`.
+
+Sidecar modification times are proxies for saved reading times, not exact page
+turn timestamps. Preserved Syncthing mtimes and correct clocks matter. A metadata
+edit can make an old location appear newer. Invalid/future sidecar times prevent
+position uploads but do not prevent identity mapping. Wait for tablet saves and
+Syncthing to finish before a manual sync.
+
+Pulls require a KOReader-style XPointer beginning with `/`, or a positive integer
+page number for paged documents. An incompatible position such as a raw EPUB CFI
+is reported and leaves the sidecar alone. Linking keys cannot translate an old
+position to a modified EPUB layout. The scanner does not update book content,
+annotations, highlights, font settings, or the reading/finished status label.
+
+## Scheduled operation
+
+Full setup enables `koreader-sync-mappings.timer`. It runs two minutes after boot
+and 15 minutes after each completed scan, with no overlapping executions of the
+same service. Each pass refreshes identities and, by default, pulls newer server
+positions into existing sidecars. It never uploads stale sidecar positions.
+
+`/etc/default/koreader-sync-mappings` configures `KOSYNC_BOOK_DIRECTORY`,
+`KOSYNC_DATABASE`, and `KOSYNC_SYNC_USER`. Empty username selects the sole account.
+`KOSYNC_PULL_SIDECARS=0` disables scheduled pulls. `KOSYNC_STRICT_FILENAMES=1`
+restores conservative collision handling. Existing configuration is preserved
+on upgrades. No registered accounts means waiting for the next run; multiple
+accounts require choosing the intended one.
+
+```sh
+sudo systemctl start koreader-sync-mappings.service
+journalctl -u koreader-sync-mappings -n 50 --no-pager
+systemctl list-timers koreader-sync-mappings.timer
 ```
-/var/lib/koreader-sync/import-backups/
-```
 
-The exact filename is printed after a successful import. Backups are private
-and retained; remove old ones manually when no longer needed. The whole batch
-is committed atomically. Fatal write failures roll it back; per-book scan
-errors allow the remaining valid books to import.
+## Writes, backups, and recovery
 
-To restore, stop `koreader-sync.service`, replace `sync.sqlite3` with the chosen
-backup owned by `herp` and mode `0600`, then start the service. Restoring a backup
-also rolls back all users/progress changes made after it was taken.
+Applied database changes are a single transaction, serialized with API writes.
+Before a changed batch, a consistent database backup is made in
+`/var/lib/koreader-sync/import-backups/`. No-change scans make no database backup.
+Setup also creates `setup-backups/` before an upgrade and retains the old table
+as `progress_legacy` when migrating from independent document records.
 
-Exit status: 0 = success (including protected newer progress or no changes),
-1 = completed with skipped malformed/unreadable files or filename collisions,
-2 = fatal error. `--database PATH` supports another database with this same
-schema. A nonexistent path is rejected, never created.
+Sidecars are updated after the database transaction, individually. Each original
+is backed up under `/var/lib/koreader-sync/sidecar-backups/<path-digest>/`, with
+`source-path.txt` identifying the original path. Only top-level position values
+are replaced/inserted; the remaining Lua text stays intact. The new file is
+validated, fsynced, and atomically renamed into place. Owner/mode are retained,
+and mtime becomes the server timestamp to prevent upload loops.
 
-Tests: install `requirements.txt`, then run `python3 -m unittest discover -s tests -v`
-from the repository root. Tests use temporary databases and include integration
-with this repository's Flask sync API.
+Files changed during the scan are skipped instead of overwritten. Database and
+filesystem writes cannot be one atomic transaction: if a sidecar pull fails,
+the committed server changes remain, and a later pass retries the file. A server
+update arriving during a pull can be delivered by the next pass. No background
+process can observe an unsaved reading position still held only in a reader's
+memory.
 
-## KOReader references
+Backups are private and retained until manually removed. To restore the database,
+stop `koreader-sync.service` and both mapping units, replace `sync.sqlite3` with
+the desired backup owned by `herp` with mode `0600`, then restart the server/timer.
+That rolls back changes made after the backup. For a sidecar, stop the timer and
+avoid simultaneous reader/Syncthing changes while restoring the saved original
+at its recorded path with its original owner/mode.
 
-Verified against KOReader commit `55471ca62fd5f405d2facdf2a6c6eb940092db50` on 2026-11-23:
+Exit status: 0 = success; 1 = completed with individual file/collision errors;
+2 = fatal error. Missing saved progress is informational, not an error. The
+oneshot service accepts status 1 while keeping the warnings in its journal.
 
-* [Filename/content IDs](https://github.com/koreader/koreader/blob/55471ca62fd5f405d2facdf2a6c6eb940092db50/plugins/kosync.koplugin/main.lua): `getFileNameDigest`, `getFileDigest`.
-* [Sidecar naming](https://github.com/koreader/koreader/blob/55471ca62fd5f405d2facdf2a6c6eb940092db50/frontend/docsettings.lua): `getSidecarDir`, `getSidecarFilename`.
-* [Partial MD5](https://github.com/koreader/koreader/blob/55471ca62fd5f405d2facdf2a6c6eb940092db50/frontend/util.lua): `partialMD5`.
-* [EPUB position](https://github.com/koreader/koreader/blob/55471ca62fd5f405d2facdf2a6c6eb940092db50/frontend/apps/reader/modules/readerrolling.lua): `onSaveSettings`.
-* [Paged position](https://github.com/koreader/koreader/blob/55471ca62fd5f405d2facdf2a6c6eb940092db50/frontend/apps/reader/modules/readerpaging.lua): `onSaveSettings`.
+## References
 
-Validation includes the Flask sync API, rollback, backups, account isolation,
-collision handling, and newer-progress protection. The parser was also checked against a fixture emitted
-by KOReader's actual `dump.lua` serializer. Installation has not been run on your
-LXC container.
+Verified against KOReader commit `55471ca62fd5f405d2facdf2a6c6eb940092db50`:
+
+* [Document keys](https://github.com/koreader/koreader/blob/55471ca62fd5f405d2facdf2a6c6eb940092db50/plugins/kosync.koplugin/main.lua).
+* [Sidecar naming](https://github.com/koreader/koreader/blob/55471ca62fd5f405d2facdf2a6c6eb940092db50/frontend/docsettings.lua).
+* [Partial MD5](https://github.com/koreader/koreader/blob/55471ca62fd5f405d2facdf2a6c6eb940092db50/frontend/util.lua).
+* [Reflowable positions](https://github.com/koreader/koreader/blob/55471ca62fd5f405d2facdf2a6c6eb940092db50/frontend/apps/reader/modules/readerrolling.lua).
+* [Paged positions](https://github.com/koreader/koreader/blob/55471ca62fd5f405d2facdf2a6c6eb940092db50/frontend/apps/reader/modules/readerpaging.lua).

@@ -23,3 +23,5 @@ jobs:
       - run: |
           bash -n setup-koreader-sync.sh
           bash -n install-kosync-import.sh
+          sh -n bin/kosync-import
+          sh -n bin/kosync-map-scan

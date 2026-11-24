@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically refresh KOReader book aliases
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15min
+Unit=koreader-sync-mappings.service
+
+[Install]
+WantedBy=timers.target

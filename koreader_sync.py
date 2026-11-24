@@ -1,7 +1,6 @@
 import os
 import time
-import sqlite3
-from contextlib import contextmanager
+import sync_storage
 import argparse
 import logging
 import traceback
@@ -12,37 +11,12 @@ USERSDB = os.environ.get("KOSYNC_DATABASE", "sync.sqlite3")
 
 # TODO return content type application/vnd.koreader.v1+json
 
-# SQLite storage. Each operation gets its own connection and transaction.
-# Standard rollback journaling keeps the database local and durable.
-@contextmanager
+# Shared SQLite identities: one position per book, multiple document aliases.
 def database():
-    connection = sqlite3.connect(USERSDB, timeout=30)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    try:
-        with connection:
-            yield connection
-    finally:
-        connection.close()
+    return sync_storage.database(USERSDB)
 
 def initDb():
-    with database() as db:
-        db.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                username TEXT PRIMARY KEY NOT NULL,
-                userkey TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS progress (
-                username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
-                document TEXT NOT NULL,
-                progress TEXT,
-                percentage REAL,
-                device TEXT,
-                device_id TEXT,
-                timestamp INTEGER NOT NULL,
-                PRIMARY KEY (username, document)
-            );
-        """)
+    sync_storage.init_db(USERSDB)
 
 def getUser(userName):
     with database() as db:
@@ -61,28 +35,13 @@ def addUser(userName, userKey):
 
 def getPosition(username, document):
     with database() as db:
-        row = db.execute(
-            "SELECT document, progress, percentage, device, device_id, timestamp "
-            "FROM progress WHERE username = ? AND document = ?",
-            (username, document)
-        ).fetchone()
-        return dict(row) if row is not None else {}
+        return sync_storage.get_position(db, username, document)
 
 def updatePosition(username, document, position):
     timestamp = int(time.time())
     with database() as db:
-        db.execute("""
-            INSERT INTO progress
-                (username, document, progress, percentage, device, device_id, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(username, document) DO UPDATE SET
-                progress = excluded.progress,
-                percentage = excluded.percentage,
-                device = excluded.device,
-                device_id = excluded.device_id,
-                timestamp = excluded.timestamp
-        """, (username, document, position.get('progress'), position.get('percentage'),
-              position.get('device'), position.get('device_id'), timestamp))
+        db.execute("BEGIN IMMEDIATE")
+        sync_storage.put_position(db, username, document, position, timestamp)
     return timestamp
 
 ### Database stuff ends here

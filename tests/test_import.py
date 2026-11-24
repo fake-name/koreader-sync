@@ -14,6 +14,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import import_sidecars as imp
+import sync_storage
 
 SCHEMA = """
 CREATE TABLE users (username TEXT PRIMARY KEY NOT NULL, userkey TEXT NOT NULL);
@@ -73,6 +74,7 @@ class ImportTests(unittest.TestCase):
         self.database = self.base / "sync.sqlite3"
         with sqlite3.connect(self.database) as db:
             db.executescript(SCHEMA)
+        sync_storage.init_db(self.database)
         self.saved = int(time.time()) - 1000
 
     def tearDown(self):
@@ -94,9 +96,9 @@ class ImportTests(unittest.TestCase):
         os.utime(sidecar, (stamp, stamp))
         return book, sidecar
 
-    def run_import(self, apply=False, force=False, user=None):
+    def run_import(self, apply=False, force=False, user=None, mappings_only=False, strict_filenames=False, pull=False):
         args = type("Args", (), dict(directory=str(self.root), database=str(self.database),
-                                     user=user, apply=apply, force=force))()
+                                     user=user, apply=apply, force=force, mappings_only=mappings_only, strict_filenames=strict_filenames, pull=pull))()
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             code = imp.run(args)
@@ -107,9 +109,14 @@ class ImportTests(unittest.TestCase):
             return {(row["username"], row["document"]): dict(row) for row in db.execute("SELECT * FROM progress")}
 
     def write_progress(self, document, timestamp, position="phone", percentage=.8, user="reader"):
-        with sqlite3.connect(self.database) as db:
-            db.execute("INSERT OR REPLACE INTO progress VALUES (?, ?, ?, ?, 'phone', 'test-device', ?)",
-                       (user, document, position, percentage, timestamp))
+        with sync_storage.database(self.database) as db:
+            db.execute("BEGIN IMMEDIATE")
+            sync_storage.put_position(db, user, document, dict(progress=position, percentage=percentage,
+                                      device="phone", device_id="test-device"), timestamp)
+
+    def clear_progress(self):
+        with sync_storage.database(self.database) as db:
+            db.execute("DELETE FROM books")
 
     def test_preview_dual_ids_backup_and_idempotence(self):
         self.book(name="Café - 01.epub")
@@ -139,12 +146,12 @@ class ImportTests(unittest.TestCase):
         self.book()
         for document in ("a" * 32, hashlib.md5(b"Book.epub").hexdigest()):
             for stamp in (self.saved, self.saved + 10):
-                with sqlite3.connect(self.database) as db:
-                    db.execute("DELETE FROM progress")
+                self.clear_progress()
                 self.write_progress(document, stamp)
                 before = self.rows()
                 self.assertIn("KEEP SERVER", self.run_import(apply=True)[1])
-                self.assertEqual(self.rows(), before)
+                self.assertEqual(len(self.rows()), 2)
+                self.assertTrue(all(row["progress"] == "phone" for row in self.rows().values()))
 
     def test_missing_partner_of_newer_identical_progress(self):
         self.book()
@@ -159,8 +166,7 @@ class ImportTests(unittest.TestCase):
         self.run_import(apply=True, force=True)
         self.assertTrue(all(row["percentage"] == .31 for row in self.rows().values()))
         self.assertTrue(all(row["timestamp"] > self.saved for row in self.rows().values()))
-        with sqlite3.connect(self.database) as db:
-            db.execute("DELETE FROM progress")
+        self.clear_progress()
         self.write_progress("a" * 32, self.saved - 1)
         self.run_import(apply=True)
         self.assertEqual(self.rows()[("reader", "a" * 32)]["percentage"], .31)
@@ -168,7 +174,7 @@ class ImportTests(unittest.TestCase):
     def test_duplicate_filename_skips_name_but_keeps_hashes(self):
         self.book(folder="one")
         self.book(folder="two", content_id="b" * 32)
-        code, text = self.run_import(apply=True)
+        code, text = self.run_import(apply=True, strict_filenames=True)
         self.assertEqual(code, 1)
         self.assertIn("COLLISION", text)
         self.assertEqual({key[1] for key in self.rows()}, {"a" * 32, "b" * 32})
@@ -178,7 +184,7 @@ class ImportTests(unittest.TestCase):
         other = self.root / "elsewhere"
         other.mkdir()
         (other / "Book.epub").write_bytes(b"unread different book")
-        self.assertEqual(self.run_import(apply=True)[0], 1)
+        self.assertEqual(self.run_import(apply=True, strict_filenames=True)[0], 1)
         self.assertEqual(len(self.rows()), 1)
 
     def test_same_content_different_names_uses_furthest_even_when_older(self):
@@ -194,7 +200,7 @@ class ImportTests(unittest.TestCase):
         self.book(folder="two", saved=self.saved + 1)
         code, text = self.run_import(apply=True)
         self.assertEqual(code, 0)
-        self.assertIn("MERGE: 2 copies", text)
+        self.assertIn("2 copies", text)
         self.assertNotIn("COLLISION", text)
         self.assertEqual(len(self.rows()), 2)
         self.assertTrue(all(r["progress"] == "/body/p[12]/text().4" for r in self.rows().values()))
@@ -281,10 +287,13 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(self.run_import(apply=True)[0], 1)
         self.assertFalse(self.rows())
 
-    def test_future_timestamp_is_reported(self):
+    def test_future_timestamp_maps_without_importing_position(self):
         self.book(saved=int(time.time()) + 3600)
-        self.assertEqual(self.run_import(apply=True)[0], 1)
-        self.assertFalse(self.rows())
+        code, text = self.run_import(apply=True)
+        self.assertEqual(code, 0)
+        self.assertIn("future sidecar", text)
+        self.assertEqual(len(self.rows()), 2)
+        self.assertTrue(all(row["progress"] is None for row in self.rows().values()))
 
     def test_changed_sidecar_skipped_between_scan_and_write(self):
         _, sidecar = self.book()
@@ -322,7 +331,7 @@ class ImportTests(unittest.TestCase):
     def test_batch_write_failure_rolls_back(self):
         self.book()
         with sqlite3.connect(self.database) as db:
-            db.execute("CREATE TRIGGER fail_insert BEFORE INSERT ON progress WHEN NEW.document != '" + "a" * 32 + "' BEGIN SELECT RAISE(ABORT, 'test failure'); END;")
+            db.execute("CREATE TRIGGER fail_insert BEFORE INSERT ON document_aliases WHEN NEW.document != '" + "a" * 32 + "' BEGIN SELECT RAISE(ABORT, 'test failure'); END;")
         with self.assertRaises(sqlite3.IntegrityError):
             self.run_import(apply=True)
         self.assertFalse(self.rows())

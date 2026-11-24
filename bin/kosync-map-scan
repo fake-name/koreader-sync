@@ -1,0 +1,16 @@
+#!/bin/sh
+# Invoked as herp by the timer. This never imports sidecar reading positions.
+set -eu
+set -- "${KOSYNC_BOOK_DIRECTORY:-/mnt/data/Reader_Sync}" \
+    --database "${KOSYNC_DATABASE:-/var/lib/koreader-sync/sync.sqlite3}" \
+    --mappings-only --apply
+if [ -n "${KOSYNC_SYNC_USER:-}" ]; then
+    set -- "$@" --user "$KOSYNC_SYNC_USER"
+fi
+if [ "${KOSYNC_STRICT_FILENAMES:-0}" = 1 ]; then
+    set -- "$@" --strict-filenames
+fi
+if [ "${KOSYNC_PULL_SIDECARS:-1}" = 1 ]; then
+    set -- "$@" --pull
+fi
+exec /usr/bin/python3 /opt/koreader-sync/import_sidecars.py "$@"

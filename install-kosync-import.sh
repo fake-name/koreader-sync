@@ -12,7 +12,9 @@ id herp >/dev/null
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'
 python3 - "$source_dir/import_sidecars.py" <<'CHECK'
 import pathlib, sys
-compile(pathlib.Path(sys.argv[1]).read_text(), sys.argv[1], 'exec')
+path = pathlib.Path(sys.argv[1])
+for source in (path, path.with_name('sync_storage.py')):
+    compile(source.read_text(), str(source), 'exec')
 CHECK
 runuser -u herp -- python3 - "$database" <<'CHECK_DB'
 import pathlib, sqlite3, sys
@@ -23,12 +25,15 @@ try:
     actual = {row[1] for row in db.execute('PRAGMA table_info(progress)')}
     if not expected <= actual:
         sys.exit('This is not the expected SQLite progress schema.')
+    if db.execute('PRAGMA user_version').fetchone()[0] != 1:
+        sys.exit('Run setup-koreader-sync.sh first to upgrade the server and database for shared book identities.')
 finally:
     db.close()
 CHECK_DB
 temporary=$(mktemp "$app_dir/.import-sidecars.XXXXXX")
 trap 'rm -f -- "$temporary"' EXIT
 install -o root -g root -m 0644 "$source_dir/import_sidecars.py" "$temporary"
+install -o root -g root -m 0644 "$source_dir/sync_storage.py" "$app_dir/sync_storage.py"
 mv -f -- "$temporary" "$app_dir/import_sidecars.py"
 install -o root -g root -m 0644 "$source_dir/docs/SIDECAR-IMPORT.md" "$app_dir/SIDECAR-IMPORT.md"
 install -o root -g root -m 0755 "$source_dir/bin/kosync-import" /usr/local/bin/kosync-import

@@ -1,23 +1,38 @@
 # koreader-sync
 
-A small, self-hosted KOReader reading-progress server using Flask, Gunicorn,
-and Python's built-in SQLite. This fork of
-[myelsukov/koreader-sync](https://github.com/myelsukov/koreader-sync) replaces
-whole-file JSON storage with transactional SQLite and adds a manual importer
-for KOReader sidecar files.
+A small self-hosted KOReader progress server using Flask, Gunicorn, and SQLite.
+This fork of [myelsukov/koreader-sync](https://github.com/myelsukov/koreader-sync)
+adds persistent book identities, filename/hash aliases, a sidecar sync tool, and
+native systemd installation. KOReader's account authentication and HTTP API
+remain compatible. Ebook distribution is handled separately, for example by
+OPDS and Syncthing.
 
-The server retains KOReader's native account authentication and progress API.
-The sidecar importer can publish a saved position under both the content-hash
-and filename-based document IDs. It does not distribute ebook files.
+## One book, multiple keys
 
-## Install or update the systemd service
+Each user has internal book IDs. Any number of content hashes and filename
+hashes can point to one book's progress record. An upload through **any linked
+key** immediately becomes visible through every other linked key.
 
-The setup script targets Debian 12+/Ubuntu 22.04+, including an LXC container
-running systemd. Python 3.10+ is required. It uses the existing OS account
-`herp`, which must have access to your book tree.
+The scanner establishes these relationships from your local files. Normal HTTP
+sync requests never guess: an unknown key starts independently until a scan
+links it. Matching basenames (including extension and case) identify the same
+book even when its content changes. Older hashes and filenames are retained.
+This supports web serial EPUBs that are replaced as chapters are added.
 
-Clone or download the **entire repository** into a working directory separate
-from `/opt/koreader-sync`. Then run the setup script as root:
+Different books with exactly the same basename will therefore be joined by
+default, regardless of directory. For a library that cannot use this convention,
+`--strict-filenames` retains the more conservative collision checks.
+
+When existing independent records or duplicate sidecars are consolidated,
+furthest percentage wins. Equal progress needs no timestamp tiebreaker. Once
+linked, ordinary client uploads keep KOReader's normal latest-update behavior,
+including intentional backward moves when rereading.
+
+## Install or upgrade
+
+For Debian 12+/Ubuntu 22.04+, including an LXC container with systemd. The
+existing OS user `herp` must have access to the book tree. Clone/download the
+**whole repository** somewhere separate from `/opt/koreader-sync`:
 
 ```sh
 git clone https://github.com/fake-name/koreader-sync.git
@@ -25,18 +40,19 @@ cd koreader-sync
 sudo bash setup-koreader-sync.sh
 ```
 
-For subsequent updates:
+For updates:
 
 ```sh
 git pull --ff-only
 sudo bash setup-koreader-sync.sh
 ```
 
-The installer uses the files in this checkout. It installs the service and the
-manual importer together, preserves existing SQLite accounts/progress, and
-backs up an existing database before updating. It briefly restarts the service;
-no import is run automatically. If setup fails after the service is stopped,
-fix the reported error and rerun setup to finish installation/startup.
+Run the **full setup once for the shared-ID upgrade**. It backs up the existing
+SQLite database, migrates users/progress transactionally, restarts the server,
+and enables the scheduled scanner. The old progress table is retained as
+`progress_legacy`; live queries use the `books` and `document_aliases` tables.
+A read-only `progress` view exposes progress by document key. Older importers
+that write that table directly must be updated along with the server.
 
 | Setting | Default |
 | --- | --- |
@@ -45,18 +61,18 @@ fix the reported error and rerun setup to finish installation/startup.
 | HTTP listener | `0.0.0.0:8082` |
 | Application and virtualenv | `/opt/koreader-sync` |
 | SQLite database | `/var/lib/koreader-sync/sync.sqlite3` |
-| Setup backups | `/var/lib/koreader-sync/setup-backups/` |
-| Import backups | `/var/lib/koreader-sync/import-backups/` |
-| Manual import command | `/usr/local/bin/kosync-import` |
+| Manual command | `/usr/local/bin/kosync-import` |
+| Scheduled scanner | `koreader-sync-mappings.timer` |
+| Scanner settings | `/etc/default/koreader-sync-mappings` |
+| Default book tree | `/mnt/data/Reader_Sync` |
 
-These defaults match the earlier `setup-koreader-sync.sh` installation, which
-can be upgraded directly. Upstream's `users.json` is **not** automatically
-migrated; it is a different format and must not be passed as a SQLite database.
+These paths match the previous SQLite installer. Upstream's `users.json` is
+not migrated automatically; do not pass JSON as a SQLite database. If setup
+fails after stopping the service, fix the reported error and rerun it.
 
-In KOReader, set the custom Progress Sync server to `http://SERVER-IP:8082`,
-then register an account or log into an existing one. Use that same sync
-account in other compatible clients. This account is separate from the OS
-account and any OPDS Basic Auth login.
+In KOReader, set the Progress Sync custom server to `http://SERVER-IP:8082`,
+then register/login with your sync account. This is separate from `herp` and
+any OPDS Basic Auth login. Compatible clients use the same server and account.
 
 ```sh
 systemctl status koreader-sync
@@ -64,44 +80,97 @@ journalctl -u koreader-sync -n 50 --no-pager
 curl http://127.0.0.1:8082/healthcheck
 ```
 
-## Manually load reading progress from sidecars
+## Manual progress sync
 
-If the SQLite server is already installed and you only want the importer,
-run `sudo bash install-kosync-import.sh` from this checkout. This does not
-restart the service or modify the server/database.
-
-Close the book on the tablet and allow Syncthing to finish copying its sidecar.
-Preview a recursive import, then explicitly apply it:
+Close the book on the tablet and let Syncthing finish copying its sidecar.
+Preview first, then apply:
 
 ```sh
 sudo -u herp kosync-import /mnt/data/Reader_Sync
 sudo -u herp kosync-import /mnt/data/Reader_Sync --apply
 ```
 
-`/mnt/data/Reader_Sync` is the default if the directory is omitted. The command
-selects the sole sync account automatically; with multiple accounts, add
-`--user YOUR_KOREADER_USERNAME`. On a root shell, `runuser -u herp --` can replace
-`sudo -u herp`.
+The sole sync account is selected automatically. If there are multiple, add
+`--user YOUR_KOREADER_USERNAME`. The default directory can be omitted. From a
+root shell, `runuser -u herp --` is equivalent to `sudo -u herp` (`runuser` is
+usually under `/usr/sbin`).
 
-For each usable sidecar it writes the saved position under:
+This pass links IDs and synchronizes progress in both directions:
 
-* **Content ID:** `partial_md5_checksum` from the sidecar, or KOReader's partial
-  MD5 calculated from the adjacent book when the saved hash is absent.
-* **Filename ID:** MD5 of the exact UTF-8 basename, including its extension.
+* Duplicate sidecars use the furthest saved percentage.
+* Newer sidecar progress can update the server. A newer/equal-time server
+  position is protected unless `--force` is specified.
+* A strictly newer server position is pulled into an existing sidecar.
+  Only reading-position fields are patched; other metadata is preserved.
+* A sidecar without a usable percentage still contributes its mappings. It
+  can receive server progress, but does not invent a 0% or 100% position.
 
-The command defaults to a read-only preview. Duplicate copies with the same
-content ID use the furthest saved percentage; equal progress is merged without
-a timestamp tiebreaker. Identical copies may share their filename ID too.
-An applied batch is transactional and backed up. Sidecar modification times
-are used to protect newer server progress; `--force` lets sidecars win when
-explicitly desired. Ambiguous
-filename IDs and invalid sidecars are reported and skipped. Books and sidecars
-are never edited, and Lua files are parsed as data without executing them.
+Use `--no-pull` for a server-only import. `--force` deliberately lets sidecar
+progress replace newer server progress. Files that change while being scanned
+are skipped for a later retry.
 
-This is a **manual snapshot**. It does not permanently link the two IDs or mirror
-subsequent client uploads between them. See
-[the importer guide](docs/SIDECAR-IMPORT.md) for collision handling, timestamps,
-limitations, exit codes, and recovery.
+After the full shared-ID upgrade, `sudo bash install-kosync-import.sh` updates
+just the importer/shared storage helper without restarting the service or
+changing timer configuration. `git pull` alone does not update installed files.
+
+## Scheduled mappings and pulls
+
+Setup enables a scan two minutes after boot and 15 minutes after each completed
+scan. It runs as `herp` and does **not upload sidecar positions**. It:
+
+1. Scans sidecars and supported ebook files, including unopened books.
+2. Calculates current partial hashes, registers new filename/hash aliases, and
+   preserves historical aliases.
+3. Pulls newer server positions into existing sidecars for Syncthing to deliver.
+
+It neither creates settings sidecars for unopened books nor modifies EPUB/PDF
+content. Initial progress uploads remain manual; normal KOReader auto-sync can
+continue handling subsequent tablet uploads.
+
+Edit `/etc/default/koreader-sync-mappings` to change the directory or account:
+
+```sh
+KOSYNC_BOOK_DIRECTORY="/mnt/data/Reader_Sync"
+KOSYNC_SYNC_USER=""            # auto-select if there is exactly one account
+KOSYNC_PULL_SIDECARS=1         # 0 makes scheduled scans strictly mapping-only
+KOSYNC_STRICT_FILENAMES=0      # 1 rejects ambiguous same-name/different-hash copies
+```
+
+Existing configuration is preserved on setup reruns. With no registered account,
+the scanner waits for a later run. With multiple accounts, set the intended one.
+
+```sh
+sudo systemctl start koreader-sync-mappings.service   # run now
+systemctl list-timers koreader-sync-mappings.timer
+journalctl -u koreader-sync-mappings -n 50 --no-pager
+sudo systemctl disable --now koreader-sync-mappings.timer  # disable scheduling
+```
+
+To change the interval, use `sudo systemctl edit koreader-sync-mappings.timer`:
+
+```ini
+[Timer]
+OnUnitInactiveSec=
+OnUnitInactiveSec=30min
+```
+
+Then run `sudo systemctl daemon-reload` and
+`sudo systemctl restart koreader-sync-mappings.timer`.
+
+## Backups and behavior
+
+Setup backups live in `setup-backups/`, importer database backups in
+`import-backups/`, and original sidecar backups in `sidecar-backups/`, all under
+`/var/lib/koreader-sync`. They are retained until manually removed.
+
+Database changes are transactional. Sidecars are backed up and atomically
+replaced individually, retaining their mode/owner and unrelated Lua content.
+Their modification time is set to the server timestamp to avoid update loops.
+A sidecar failure leaves the server update committed; a later scan can retry it.
+
+See [the importer guide](docs/SIDECAR-IMPORT.md) for matching rules, timestamps,
+limitations, and recovery. Changing EPUB content can invalidate an old XPointer;
+linking hashes does not translate positions between different document layouts.
 
 ## Run without systemd
 
@@ -112,15 +181,14 @@ KOSYNC_DATABASE="$PWD/sync.sqlite3" .venv/bin/gunicorn \
     --bind 0.0.0.0:8082 --workers 1 --threads 2 --worker-class gthread wsgi:app
 ```
 
-`KOSYNC_DATABASE` selects the database for WSGI. If omitted, WSGI uses the
-system-service database path above. The compatibility entry point
-`python koreader-flask.py --help` remains available; it launches Flask's
-development server and defaults to `./sync.sqlite3` (or `KOSYNC_DATABASE`).
-
-To use the importer without installing its command wrapper:
+WSGI uses `KOSYNC_DATABASE`, defaulting to the system-service database path.
+`python koreader-flask.py --help` remains available for the development server.
+To sync without installing command wrappers:
 
 ```sh
 .venv/bin/python import_sidecars.py /path/to/books --database ./sync.sqlite3
+.venv/bin/python import_sidecars.py /path/to/books --database ./sync.sqlite3 --apply
+.venv/bin/python import_sidecars.py /path/to/books --database ./sync.sqlite3 --mappings-only --pull --apply
 ```
 
 ## Development
@@ -131,10 +199,11 @@ python3 -m venv .venv
 .venv/bin/python -m unittest discover -s tests -v
 bash -n setup-koreader-sync.sh
 bash -n install-kosync-import.sh
+sh -n bin/kosync-map-scan
 ```
 
-Tests use temporary databases. They cover authentication, user isolation,
-concurrent writes, persistence, importer/parser behavior, rollback, backups,
-and retrieving imported progress through the server API.
+Tests use temporary databases/files. They cover API authentication and isolation,
+concurrency, migration, alias linking, hash churn, backups, parser behavior,
+bidirectional progress, atomic sidecar writes, and preservation of annotations.
 
 The original project's invitation to modify it was: “Do whatever you want to”.
